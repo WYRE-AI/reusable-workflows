@@ -1,0 +1,807 @@
+name: MCP Server Release (reusable)
+
+# Canonical release workflow for WYRE-AI/*-mcp repositories.
+# Adapted 2026-08-24 from wyre-technology/.github@8bfc9b3 for the org migration:
+# npm scope @wyre-technology -> @wyre-ai, registry namespace io.github.wyre-ai,
+# plus a legacy-scope npm read-compat line for the transition period.
+# Called from each per-repo `.github/workflows/release.yml` for the
+# semantic-release → Docker push → MCP Registry publish chain.
+#
+# ROOT-CAUSE BUG FIXED (Tier A registry coverage gap — issue #16):
+#
+#   Tier A repos (`atera-mcp`, `crewhu-mcp`, `datto-rmm-mcp`, `ironscales-mcp`,
+#   `proofpoint-mcp`) all declare `"type":"module"` in package.json. Their
+#   bespoke "Get released version" steps used:
+#
+#       VERSION=$(node -e 'process.stdout.write(require("./package.json").version)')
+#
+#   Node ≥22.12 honours `"type":"module"` in the nearest package.json when
+#   evaluating --eval/--print scripts — which puts `require()` out of scope.
+#   The resulting ReferenceError is silently swallowed by bash command
+#   substitution `$( ... )`: bash set -e does NOT propagate a non-zero exit
+#   from a command that is the sole RHS of a variable assignment. VERSION
+#   silently becomes "". The release job exits 0 with `version=""`. The docker
+#   job runs (release *succeeded*), hits the guard `if [ -z "$RELEASE_VERSION" ]`,
+#   exits 1. With docker failed, `mcp-registry`'s `needs: [release, docker]`
+#   cascades to `skipped` (not `failed`) — the failure is completely silent.
+#   autotask-mcp is unaffected because it lacks `"type":"module"`.
+#
+#   Fix: use `jq -r '.version' package.json`. jq is pre-installed on every
+#   GitHub-hosted Ubuntu runner, parses JSON natively, and is immune to the
+#   Node.js module system entirely.
+#
+# SECOND BUG FIXED: unreliable "was a release actually cut?" detection.
+#
+#   The prior pattern (jq version + `gh release view`) returns `released=true`
+#   on *every* push to main, even no-op ones where semantic-release exits 0
+#   without cutting a release, because the previous version tag already exists.
+#   This triggers unnecessary docker rebuilds and mcp-registry re-publishes.
+#
+#   Fix: after semantic-release, run `git fetch --tags` then inspect
+#   `git tag --points-at HEAD`. A semver tag on HEAD means semantic-release
+#   just pushed a new tag for this commit. No tag → no release.
+#
+# THIRD BUG FIXED: first-release failure on the @semantic-release/github
+# `success` step (missing `pull-requests` permission).
+#
+#   The release job previously granted only `contents: write`, `issues: write`,
+#   and `packages: read`. After cutting a release, @semantic-release/github's
+#   `success` step runs an `associatedPullRequests` GraphQL READ so it can post
+#   a "released in vX.Y.Z" comment on every PR swept into the release. Without
+#   `pull-requests` permission that read returns `FORBIDDEN` and the plugin
+#   throws — failing the whole release. On a FIRST release (which sweeps many
+#   already-merged PRs) this reliably kills the run; observed live on pax8-mcp:
+#     GraphqlResponseError ... type: 'FORBIDDEN' ... associatedPullRequests
+#     → Resource not accessible by integration
+#   pax8 was patched per-repo with `successComment: false`, but the durable
+#   fleet fix is to grant the permission the default behaviour actually needs.
+#
+#   Fix: add `pull-requests: write` to the release job below. This is the
+#   minimal correct scope — it lets the default successComment/failComment
+#   behaviour work instead of forcing every repo to disable it.
+#
+#   CALLER PROPAGATION (REQUIRED): a reusable workflow can only ever REDUCE the
+#   permissions the CALLER granted its `uses:` job — never expand them. So this
+#   job only receives `pull-requests: write` if the per-repo thin caller
+#   (`.github/workflows/release.yml`) also lists `pull-requests: write` in the
+#   `permissions:` block on the job that calls this reusable. Callers must add
+#   it; see the CHANGELOG entry for the fleet-wide follow-up.
+#
+# FOURTH BUG FIXED: the Claude Desktop `.mcpb` bundle stopped shipping.
+#
+#   The hand-rolled per-repo workflows this reusable replaced carried a
+#   "Pack and upload MCPB bundle" step (`npm run pack:mcpb` + `gh release
+#   upload`). It was not carried over here, so every repo that migrated to this
+#   reusable silently stopped attaching its bundle: 25 of the 26 repos with a
+#   `pack:mcpb` script now publish releases with zero assets, while their
+#   READMEs still say "download the .mcpb from the latest release"
+#   (autotask-mcp#244 — last good bundle v2.28.8, first empty release v2.30.0).
+#   Only itglue-mcp still ships one, via a repo-local stopgap job whose own
+#   comment asks for exactly this upstreaming.
+#
+#   Fix: the `mcpb` job below. Auto-detected from the presence of a
+#   `pack:mcpb` script, so repos get the bundle back by bumping their pin
+#   alone — no caller edits across 25 repos.
+#
+#   VERSION STAMPING IS LOAD-BEARING: pack scripts copy package.json's version
+#   into the bundle's manifest.json, and semantic-release does not commit its
+#   bump back (no @semantic-release/git), so package.json at the release tag
+#   still holds the PREVIOUS version. Verified live against autotask-mcp at
+#   v2.32.2: packing the tag as-is yields a bundle stamped 2.18.0 (the version
+#   package.json has been frozen at on main for 14 releases); stamping first
+#   yields the correct 2.32.2. Without the stamp this job would ship a
+#   plausible-looking but wrongly-versioned bundle — worse than shipping none.
+#
+# FIFTH BUG FIXED: vacuous CI on pull requests (5 repos with zero PR-time
+# validation of any kind — verified 2026-08-15).
+#
+#   Every per-repo caller invokes this reusable on BOTH push-to-main and
+#   pull_request, but the only job that existed here (`release`) is gated to
+#   push-to-main only. On a PR the job is skipped entirely — the caller's
+#   check goes green because nothing ran, not because anything passed.
+#
+#   Fix: the `verify` job below carries no gate at all, so it runs on every
+#   event the caller fires this workflow for. `release` now also
+#   `needs: [verify]`, so a failing build/lint/test blocks publish too — not
+#   previously enforced even on the push path. See the comment on `verify`
+#   itself for the full detail and why this is a new parallel job rather than
+#   a restructure of `release`'s own (unchanged) steps.
+#
+# GATING CONTRACT:
+#   verify       ← unconditional. Runs on push AND pull_request alike.
+#   release      ← push-to-main only, AND needs: [verify].
+#   docker       ← runs only when release.outputs.released == 'true'
+#   mcpb         ← same gate, in its own job needing only `release`, so a pack
+#                  failure does not stop docker/mcp-registry/security from
+#                  running here. NOTE: that is workflow-internal only. Callers
+#                  invoke this file as ONE job, so any failure here fails the
+#                  caller's `release` job and skips a caller `deploy:
+#                  needs: release`. A pack failure IS deploy-blocking from the
+#                  caller's side — see the note above the mcpb job.
+#   mcp-registry ← always() ensures its `if:` is evaluated even when docker
+#                  was skipped; then guards on released == 'true' AND
+#                  docker result == 'success'.
+#   security     ← same gating as mcp-registry: scans the exact image tag the
+#                  docker job just pushed and uploads SARIF to code scanning.
+
+on:
+  workflow_call:
+    inputs:
+      server-name:
+        description: >
+          Server slug used in the MCP Registry search verification query,
+          e.g. "atera-mcp" → queries io.github.WYRE-AI/atera-mcp.
+        required: true
+        type: string
+      image-name:
+        description: >
+          Full GHCR image path without tag or digest,
+          e.g. "ghcr.io/wyre-ai/atera-mcp".
+        required: true
+        type: string
+      node-version:
+        description: 'Node.js version for install, build, and semantic-release.'
+        required: false
+        type: string
+        default: '22'
+      platforms:
+        description: 'Docker target platform(s). Comma-separated for multi-arch.'
+        required: false
+        type: string
+        default: 'linux/amd64'
+    outputs:
+      version:
+        description: 'Released semver (no "v" prefix). Empty string when no release was cut.'
+        value: ${{ jobs.release.outputs.version }}
+      released:
+        description: '"true" when semantic-release cut a new release; "false" otherwise.'
+        value: ${{ jobs.release.outputs.released }}
+      tag_name:
+        description: 'Git tag created (e.g. "v1.5.0"). Empty when no release was cut.'
+        value: ${{ jobs.release.outputs.tag_name }}
+      digest:
+        description: 'Docker image digest (sha256:…). Empty when no release was cut.'
+        value: ${{ jobs.docker.outputs.digest }}
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # 0. verify — build/lint/test, UNCONDITIONAL (runs on every event this
+  #    reusable is called for: push AND pull_request).
+  #
+  #    ROOT-CAUSE BUG FIXED (vacuous CI on PRs — 5 repos with zero PR-time
+  #    validation of any kind: alternative-payments-mcp, avanan-legacy-mcp,
+  #    clio-mcp, salesforce-mcp, sentinelone-mcp; verified 2026-08-15):
+  #
+  #    Every per-repo caller (`.github/workflows/release.yml`) already invokes
+  #    this reusable workflow on BOTH push-to-main and pull_request — but the
+  #    only job that existed here (`release`, below) is gated
+  #    `if: event == push && ref == main`. On a PR the condition is false, the
+  #    job is skipped, and NOTHING runs — not npm ci, not the build, nothing.
+  #    The caller's PR check goes green because the job it invited never
+  #    executed, not because anything passed. Repos with their own standalone
+  #    `ci.yml` (Tier 1) or wired to the separate `mcp-assert.yml` reusable
+  #    (Tier 2) were unaffected; repos with neither had zero PR-time coverage.
+  #
+  #    Fix: this job carries no `if:` gate at all, so it runs on every event
+  #    the caller fires it for — push AND pull_request alike. `release`
+  #    (below) keeps its existing push-to-main-only gate AND now also
+  #    `needs: [verify]`, so publish can't proceed past a failing build/lint/
+  #    test even on the push path (previously unenforced there too — `release`
+  #    ran its own build but nothing failed the job on a bad lint or test).
+  #
+  #    Deliberately a SEPARATE job rather than restructuring `release`'s own
+  #    steps: `release`'s build/install steps are unchanged, untouched, and
+  #    still work exactly as before for the push-to-main path this file has
+  #    three separate historical bug-fix comments protecting — a parallel
+  #    unconditional job is the minimal-diff way to add PR-time coverage
+  #    without touching that already-hardened path.
+  #
+  #    `--if-present` on lint/test: this reusable is called by every *-mcp
+  #    repo in the fleet, and not all of them declare a `lint` script (2 of
+  #    the 5 originally-exposed repos don't). `build` has no such guard — a
+  #    repo without a working build script was never going to survive the
+  #    existing `release` job's own unconditional `npm run build` either, so
+  #    requiring it here changes nothing about what already had to hold true.
+  # ────────────────────────────────────────────────────────────────────────────
+  verify:
+    name: Build, Lint, Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read   # npm ci of @wyre-technology/* SDKs from GitHub Packages
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          # Canonical GitHub Packages auth — matches the release job below and
+          # mcp-server-ci.yml.
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@wyre-ai'
+
+      # Transition compat: map the old @wyre-technology scope to GitHub
+      # Packages too, so repos still depending on @wyre-technology/* SDKs
+      # (not yet republished under @wyre-ai) keep resolving during migration.
+      - name: Add legacy npm scope registry (migration compat)
+        run: echo "@wyre-technology:registry=https://npm.pkg.github.com" >> "$NPM_CONFIG_USERCONFIG"
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        run: npm run build
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Test
+        run: npm test --if-present
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 1. semantic-release
+  # ────────────────────────────────────────────────────────────────────────────
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [verify]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write       # push tags + create GitHub releases
+      issues: write         # @semantic-release/github creates release-linked issues
+      pull-requests: write  # @semantic-release/github success step reads + comments on associated PRs
+      packages: read        # npm ci of @wyre-technology/* SDKs from GitHub Packages
+    outputs:
+      version:  ${{ steps.detect.outputs.version }}
+      released: ${{ steps.detect.outputs.released }}
+      tag_name: ${{ steps.detect.outputs.tag_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          # Canonical GitHub Packages auth — matches mcp-server-ci.yml.
+          # setup-node writes the token into .npmrc so @wyre-technology/* deps
+          # resolve without manual .npmrc manipulation (which is fragile under
+          # npm ci caching and can break in ESM repos).
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@wyre-ai'
+
+      # Transition compat: map the old @wyre-technology scope to GitHub
+      # Packages too, so repos still depending on @wyre-technology/* SDKs
+      # (not yet republished under @wyre-ai) keep resolving during migration.
+      - name: Add legacy npm scope registry (migration compat)
+        run: echo "@wyre-technology:registry=https://npm.pkg.github.com" >> "$NPM_CONFIG_USERCONFIG"
+
+      # GITHUB_TOKEN (with this job's `packages: read`) is the canonical npm
+      # auth for the public @wyre-technology/* SDKs — the same pattern
+      # mcp-assert.yml uses, proven to download cross-repo packages fresh.
+      # Do NOT swap in a custom GitHub App installation token here: the npm
+      # registry rejects those for cross-repo package reads with 403
+      # "Permission installation not allowed to Read organization package"
+      # (that 403 previously seen here was this job missing `packages: read`,
+      # not a GITHUB_TOKEN limitation). If an SDK package ever goes private,
+      # grant the consuming repo access in the package's "Manage Actions
+      # access" settings — GITHUB_TOKEN then still works.
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        run: npm run build
+
+      - name: Semantic Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
+
+      - name: Detect released version
+        id: detect
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch tags that semantic-release just pushed to origin.
+          git fetch --tags
+
+          # A semver tag pointing at HEAD means semantic-release cut a release
+          # on this exact commit. No tag → no release (no-op push).
+          #
+          # --sort=-version:refname puts the highest semver first so head -1
+          # picks the stable release over a pre-release if both exist on HEAD.
+          HEAD_TAG=$(git tag --points-at HEAD --sort=-version:refname \
+            | grep -E '^v[0-9]' | head -1)
+
+          if [ -n "$HEAD_TAG" ] \
+             && gh release view "$HEAD_TAG" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+            VERSION="${HEAD_TAG#v}"
+            printf 'version=%s\n'  "$VERSION"   >> "$GITHUB_OUTPUT"
+            printf 'tag_name=%s\n' "$HEAD_TAG"  >> "$GITHUB_OUTPUT"
+            printf 'released=true\n'            >> "$GITHUB_OUTPUT"
+            echo "::notice::Released $HEAD_TAG"
+          else
+            printf 'released=false\n' >> "$GITHUB_OUTPUT"
+            echo "::notice::No new release — semantic-release found no releasable commits."
+          fi
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 2. Docker build + GHCR push
+  #    Gated on released == 'true' so it never fires on a no-op push and can
+  #    never be the mechanism through which an empty version reaches the guard.
+  # ────────────────────────────────────────────────────────────────────────────
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [release]
+    # KEY FIX: gate on released == 'true', not just push && main.
+    # Previously the per-repo pattern gated docker only on the event/branch
+    # condition — identical to release's gate. When release was skipped or
+    # produced an empty version output, docker still ran and hit the
+    # "RELEASE_VERSION is empty" guard, silently cascading mcp-registry to
+    # `skipped`. Now docker simply does not run unless a real release was cut.
+    if: needs.release.outputs.released == 'true'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.resolve.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
+        with:
+          images: ${{ inputs.image-name }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.release.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.release.outputs.version }}
+            type=semver,pattern={{major}},value=v${{ needs.release.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # GitHub Packages auth for `npm ci` of private @wyre-technology/node-* SDK
+      # deps inside the Docker build. *-mcp Dockerfiles use one of three styles;
+      # we supply all three so this reusable is a drop-in for every repo without
+      # per-repo Dockerfile changes:
+      #   1. `ARG NODE_AUTH_TOKEN` + committed .npmrc referencing it  → build-arg
+      #   2. `ARG GITHUB_TOKEN` + Dockerfile writes its own .npmrc      → build-arg
+      #   3. `RUN --mount=type=secret,id=npmrc`                          → secret-file
+      # Unconsumed build-args / secrets are a harmless Docker warning, never an error.
+      # Same npm auth as the release job: GITHUB_TOKEN (this job already has
+      # `packages: write` for the ghcr push, which covers registry reads of the
+      # public @wyre-technology/* SDKs). Custom App installation tokens are NOT
+      # accepted by the npm registry for cross-repo package reads (403
+      # "Permission installation not allowed to Read organization package") —
+      # first proven live by ninjaone-mcp v2.0.0's failed image build.
+      - name: Prepare npmrc build secret
+        run: |
+          {
+            echo "@wyre-ai:registry=https://npm.pkg.github.com"
+            # Transition compat: repos may still depend on @wyre-technology/*
+            # SDKs until each SDK republishes under @wyre-ai.
+            echo "@wyre-technology:registry=https://npm.pkg.github.com"
+            echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}"
+            echo "always-auth=true"
+          } > /tmp/.npmrc
+
+      # provenance: false — 2026-07-23 outage root cause. BuildKit's default
+      # SLSA provenance attestation adds an `attestation-manifest` sibling
+      # (platform: unknown/unknown, single in-toto layer) alongside the real
+      # per-platform image in the pushed OCI index. steps.push.outputs.digest
+      # is supposed to resolve to the real image, but for blumira-mcp,
+      # mimecast-mcp, and timezest-mcp's 2026-07-23 release runs it instead
+      # resolved to the attestation-manifest digest — a known nondeterministic
+      # footgun of docker/build-push-action with provenance left on default.
+      # ACA then tried to pull+unpack that digest as a container image, which
+      # is just a JSON attestation blob with no real filesystem layers:
+      # `ctr: failed to unpack image on snapshotter overlaybd: mismatched
+      # image rootfs and manifest layers` — an infinite pull-retry loop,
+      # silently down for ~2.5 days until an unrelated audit caught it.
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          platforms: ${{ inputs.platforms }}
+          push: true
+          provenance: false
+          tags: |
+            ${{ inputs.image-name }}:latest
+            ${{ inputs.image-name }}:v${{ needs.release.outputs.version }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          secret-files: |
+            npmrc=/tmp/.npmrc
+          build-args: |
+            VERSION=${{ needs.release.outputs.version }}
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            NODE_AUTH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+            GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+
+      # Belt-and-suspenders (defense-in-depth, independent of provenance:false
+      # above): never trust steps.push.outputs.digest blindly downstream.
+      # Resolve the digest through `docker buildx imagetools inspect` and hard-
+      # fail if it doesn't carry a real image config — i.e. if it's an
+      # attestation manifest, an index with no matching platform entry, or
+      # anything else that isn't an actual pullable container image. This is
+      # what would have caught the 2026-07-23 outage before the bad digest
+      # ever reached the deploy job, regardless of what caused it.
+      - name: Resolve and verify real image digest
+        id: resolve
+        run: |
+          DIGEST="${{ steps.push.outputs.digest }}"
+          REF="${{ inputs.image-name }}@${DIGEST}"
+
+          # A real image manifest (or an index resolving to one) has a non-empty
+          # Config.Env or Config.Cmd. An attestation-manifest's config is a bare
+          # {} (no Env/Cmd/Entrypoint) because it never describes a runnable
+          # container — it's the reliable, cheap discriminator between "this is
+          # a container image" and "this is some other manifest shape."
+          #
+          # `--format` exposes EXACTLY three fields: .Name, .Manifest, .Image
+          # (docker/docs, cli/buildx/docker_buildx_imagetools_inspect.yaml).
+          # There is no top-level .Config; asking for one dies with
+          #   template: :1:7: executing "" at <.Config>: can't evaluate field
+          #   Config in type image
+          # which is what autotask-mcp v2.32.4 hit — the first release to run
+          # this step after #40 landed. It failed the docker job and cascaded
+          # mcp-registry/security/deploy to skipped even though the image had
+          # pushed fine. The image config lives under .Image.
+          IMAGE=$(docker buildx imagetools inspect "$REF" --format '{{json .Image}}' 2>&1) \
+            || { echo "::error::imagetools inspect failed for $REF: $IMAGE"; exit 1; }
+
+          # .Image is the config object for a single-platform build, but a
+          # PLATFORM-KEYED MAP ({"linux/amd64": {...}, "linux/arm64": {...}})
+          # for a multi-arch one — i.e. any caller passing a comma-separated
+          # `platforms:`. Normalise both shapes to a list and require EVERY
+          # platform to carry a real config, so a multi-arch build cannot pass
+          # on the strength of one good platform. A null/odd .Image makes jq
+          # fail, which lands on the safe side (reject).
+          #
+          # CASING: this marshals an OCI image config, whose top-level key is
+          # LOWERCASE `config` (capitalised `Env` nested inside) — verified
+          # against the real config blob for
+          # ghcr.io/wyre-technology/autotask-mcp@sha256:b92a86a8…, whose keys
+          # are exactly: architecture, config, created, history, os, rootfs.
+          # An earlier revision of this check tested has("Config") and so fell
+          # into the platform-map branch for every single-platform build,
+          # rejecting perfectly good images and blocking autotask-mcp v2.32.5's
+          # deploy. `docker image inspect` (a DIFFERENT command) does return
+          # capitalised `Config`, which is the trap — accept either.
+          if ! printf '%s' "$IMAGE" | jq -e '
+                def cfg: (.config // .Config // {});
+                (if (has("config") or has("Config")) then [.] else [.[]] end)
+                | length > 0 and all(.[]; (cfg.Env // []) | length > 0)
+              ' >/dev/null 2>&1; then
+            echo "::error::Resolved digest $DIGEST for ${{ inputs.image-name }} does not carry a real image config (empty Env) — this looks like an attestation-manifest or other non-image manifest, not a runnable container. Refusing to hand this digest to the deploy job. See the 2026-07-23 outage root-cause comment above this step."
+            # Print what we actually saw. Without this, diagnosing a rejection
+            # means pulling the manifest out of the registry by hand — which is
+            # exactly what the v2.32.5 false-positive cost.
+            echo "::group::Observed .Image payload (first 2000 chars)"
+            printf '%s' "$IMAGE" | head -c 2000
+            echo
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Verified $REF is a real image (non-empty config.Env)."
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 3. MCPB bundle → GitHub release asset
+  #    Needs only `release`, never `docker`, so a pack failure does not stop
+  #    docker/mcp-registry/security from RUNNING inside this workflow.
+  #
+  #    IMPORTANT — this does NOT isolate the caller's deploy. A caller invokes
+  #    this whole file as a SINGLE job (`release: uses: …mcp-server-release.yml`),
+  #    so every job here rolls up into that one job's conclusion. Any failure
+  #    inside — including this one — marks the caller's `release` job failed,
+  #    and a caller `deploy: needs: release` is therefore SKIPPED. Observed on
+  #    atera-mcp: docker, mcp-registry and security all succeeded, mcpb failed,
+  #    and deploy was skipped anyway. An earlier revision of this comment
+  #    claimed a pack failure "cannot cascade into skipping the deploy chain";
+  #    that is true within this workflow and false from the caller's side.
+  #
+  #    So a bug in this job IS deploy-blocking. Keep it boring and keep it
+  #    tested against a repo that does NOT carry @anthropic-ai/mcpb.
+  # ────────────────────────────────────────────────────────────────────────────
+  mcpb:
+    name: Pack and upload MCPB bundle
+    runs-on: ubuntu-latest
+    needs: [release]
+    if: needs.release.outputs.released == 'true'
+    permissions:
+      contents: write   # gh release upload
+      packages: read    # npm ci of @wyre-technology/* SDKs from GitHub Packages
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ needs.release.outputs.tag_name }}
+
+      # Auto-detection rather than a caller input: 25 repos regressed at once
+      # and all of them already declare `pack:mcpb`. Gating on an input would
+      # mean 25 caller PRs before anyone sees a bundle; gating on the script
+      # means a pin bump is sufficient. Repos without the script no-op here in
+      # a few seconds. A job-level `if:` cannot do this — the condition is
+      # evaluated before any checkout exists to inspect.
+      - name: Detect MCPB support
+        id: detect
+        run: |
+          if jq -e '.scripts["pack:mcpb"]' package.json >/dev/null 2>&1; then
+            echo 'supported=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'supported=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::No pack:mcpb script in package.json — no bundle to build.'
+          fi
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.supported == 'true'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@wyre-ai'
+
+      # Transition compat: map the old @wyre-technology scope to GitHub
+      # Packages too, so repos still depending on @wyre-technology/* SDKs
+      # (not yet republished under @wyre-ai) keep resolving during migration.
+      # Gated like the surrounding steps: without setup-node having run,
+      # NPM_CONFIG_USERCONFIG is unset and the append fails (broke the pilot).
+      - name: Add legacy npm scope registry (migration compat)
+        if: steps.detect.outputs.supported == 'true'
+        run: echo "@wyre-technology:registry=https://npm.pkg.github.com" >> "$NPM_CONFIG_USERCONFIG"
+
+      # Install BEFORE stamping: `npm ci` hard-fails if package.json and
+      # package-lock.json disagree on the version, and `npm version` rewrites
+      # both. Installing first keeps the lockfile pristine for the strict check.
+      - name: Install dependencies
+        if: steps.detect.outputs.supported == 'true'
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stamp released version into package.json
+        if: steps.detect.outputs.supported == 'true'
+        # See "FOURTH BUG FIXED" above: pack scripts copy this version into the
+        # bundle manifest, and the tag's package.json still holds the previous
+        # version because semantic-release never commits its bump back.
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      # Pack scripts shell out to `npx mcpb pack`, which needs the mcpb CLI on
+      # PATH. Only 2 of the 26 repos with a pack:mcpb script (autotask-mcp,
+      # blumira-mcp) carry `@anthropic-ai/mcpb` as a dependency; in the other 24
+      # `npx mcpb` tries to fetch a package literally named "mcpb" from the
+      # public registry and dies with:
+      #   npm error 404 Not Found - GET https://registry.npmjs.org/mcpb
+      # The hand-rolled per-repo workflows all ran this global install for
+      # exactly that reason; this job originally omitted it, having been
+      # validated only against autotask-mcp — one of the two repos where the
+      # omission is invisible. Caught live on atera-mcp.
+      #
+      # `npx` resolves node_modules/.bin BEFORE the global prefix, so a repo
+      # that does pin its own @anthropic-ai/mcpb version still wins; this is a
+      # fallback, not an override.
+      - name: Install MCPB CLI
+        if: steps.detect.outputs.supported == 'true'
+        run: npm install -g @anthropic-ai/mcpb
+
+      - name: Pack MCPB bundle
+        if: steps.detect.outputs.supported == 'true'
+        run: npm run pack:mcpb
+
+      - name: Upload bundle to GitHub release
+        if: steps.detect.outputs.supported == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
+        # Glob rather than deriving the filename from package.json: pack scripts
+        # differ across the fleet in how they strip npm scopes. Fail loudly on
+        # zero matches — a silently-skipped upload is the exact failure mode
+        # this whole job exists to correct.
+        run: |
+          shopt -s nullglob
+          bundles=(*.mcpb)
+          if [ ${#bundles[@]} -eq 0 ]; then
+            echo "::error::pack:mcpb succeeded but produced no .mcpb file at the repo root."
+            exit 1
+          fi
+          printf 'Uploading to %s: %s\n' "$TAG_NAME" "${bundles[*]}"
+          gh release upload "$TAG_NAME" "${bundles[@]}" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 4. MCP Registry publish
+  #    always() ensures this job's `if:` is evaluated even when docker was
+  #    skipped (which happens on no-op pushes). Without always(), GitHub
+  #    Actions skips the job entirely when any needed job did not succeed,
+  #    bypassing the `if:` check — which would make future debugging harder.
+  #    The explicit `needs.docker.result == 'success'` guard ensures we never
+  #    publish a version whose image failed or was never pushed to GHCR.
+  # ────────────────────────────────────────────────────────────────────────────
+  mcp-registry:
+    name: Publish to MCP Registry
+    runs-on: ubuntu-latest
+    needs: [release, docker]
+    if: >
+      always() &&
+      needs.release.outputs.released == 'true' &&
+      needs.docker.result == 'success'
+    permissions:
+      id-token: write   # GitHub OIDC auth to MCP Registry
+      contents: read
+    env:
+      VERSION:    ${{ needs.release.outputs.version }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+
+    steps:
+      - name: Checkout (post-release HEAD)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ needs.release.outputs.tag_name }}
+
+      # SUPPLY-CHAIN FIX (fast-follow to the concurrency PR on this file;
+      # reported by murph while investigating an unrelated stale task about
+      # mcp-publisher signature verification):
+      #
+      #   This job holds `id-token: write` and MCP Registry publish rights.
+      #   The old install step curl'd `.../releases/latest/download/...` and
+      #   piped straight into `tar xz` with no version pin, no checksum, and
+      #   no signature check — if the upstream release pipeline (or a single
+      #   asset) were ever compromised, this would execute arbitrary code
+      #   with our publish credentials on every release, fleet-wide.
+      #
+      #   Fix: pin to an exact tag and verify the tarball against upstream's
+      #   own Sigstore keyless-signing bundle (cosign verify-blob) BEFORE
+      #   extracting or executing anything. Identity/issuer below were read
+      #   directly out of the certificate embedded in the real v1.8.1
+      #   mcp-publisher_linux_amd64.tar.gz.sigstore.json bundle (SAN URI +
+      #   OIDC issuer extension), not guessed:
+      #     SAN: https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/v1.8.1
+      #     Issuer: https://token.actions.githubusercontent.com
+      #   That bundle is produced by upstream's own `.goreleaser.yaml`
+      #   (`cosign sign-blob --bundle=...` in keyless mode) driven by
+      #   `.github/workflows/release.yml` on `release: published`, which
+      #   confirms the SAN's `@refs/tags/vX.Y.Z` shape is the actual signer,
+      #   not an assumption.
+      #
+      #   Hardcoded to linux_amd64: this job always runs on ubuntu-latest
+      #   (GitHub-hosted x86_64), so the old uname-based OS/arch detection is
+      #   unneeded complexity. If this workflow ever moves to an ARM runner,
+      #   MCP_PUBLISHER_ASSET below must change too — it will NOT
+      #   auto-detect the way the old curl command did.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
+      - name: Download mcp-publisher (pinned release)
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_ASSET: mcp-publisher_linux_amd64.tar.gz
+        run: |
+          BASE_URL="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          curl -fsSL -o "${MCP_PUBLISHER_ASSET}"               "${BASE_URL}/${MCP_PUBLISHER_ASSET}"
+          curl -fsSL -o "${MCP_PUBLISHER_ASSET}.sigstore.json" "${BASE_URL}/${MCP_PUBLISHER_ASSET}.sigstore.json"
+
+      - name: Verify mcp-publisher signature (cosign / Sigstore keyless)
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_ASSET: mcp-publisher_linux_amd64.tar.gz
+        run: |
+          cosign verify-blob \
+            --bundle "${MCP_PUBLISHER_ASSET}.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${MCP_PUBLISHER_ASSET}"
+
+      - name: Extract mcp-publisher
+        env:
+          MCP_PUBLISHER_ASSET: mcp-publisher_linux_amd64.tar.gz
+        run: tar xz -f "${MCP_PUBLISHER_ASSET}" mcp-publisher
+
+      - name: Stamp version into server.json
+        # server.json is committed with "0.0.0" placeholders; replace with the
+        # just-released version so the OCI identifier points at the image tag
+        # that the docker job just pushed.
+        run: |
+          jq --arg v   "$VERSION" \
+             --arg img  "$IMAGE_NAME" \
+            '.version = $v | .packages[0].identifier = ($img + ":v" + $v)' \
+            server.json > server.json.tmp
+          mv server.json.tmp server.json
+          cat server.json
+
+      - name: Validate server.json
+        run: ./mcp-publisher validate
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish
+
+      - name: Verify registry listing
+        run: |
+          sleep 5
+          curl -sf \
+            "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.WYRE-AI/${{ inputs.server-name }}" \
+            | jq '.servers[]?.server | {name, version}'
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 5. Trivy image scan → GitHub code scanning
+  #    Scans the exact tag the docker job just pushed (not :latest, which can
+  #    race with concurrent pushes) and uploads SARIF so findings appear under
+  #    Security → Code scanning. Same always()/result gating as mcp-registry:
+  #    no release or failed docker build → nothing to scan.
+  #
+  #    NOTE (private repos): SARIF upload requires GitHub Code Security to be
+  #    enabled on the repo; public repos get it for free.
+  # ────────────────────────────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [release, docker]
+    if: >
+      always() &&
+      needs.release.outputs.released == 'true' &&
+      needs.docker.result == 'success'
+    permissions:
+      contents: read
+      packages: read           # ghcr pull of the just-pushed image
+      security-events: write   # SARIF upload to code scanning
+
+    steps:
+      # New ghcr packages default to PRIVATE on first push; Trivy's remote
+      # registry pull is unauthenticated without this login (worked in the old
+      # org only because every package there was already public).
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8  # v0.36.0
+        with:
+          image-ref: '${{ inputs.image-name }}:v${{ needs.release.outputs.version }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub code scanning
+        uses: github/codeql-action/upload-sarif@c54b30b7df092240050e69945842bc67aee0f0f4  # v4.37.3
+        with:
+          sarif_file: 'trivy-results.sarif'

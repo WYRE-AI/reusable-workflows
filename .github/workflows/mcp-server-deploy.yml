@@ -1,0 +1,147 @@
+name: MCP Server Deploy (reusable)
+
+# Canonical deploy workflow for WYRE-AI/*-mcp repositories.
+# Adapted 2026-08-24 from wyre-technology/.github@198605d for the org migration.
+# NOTE: the gwp-* Container Apps fleet currently runs in the LEGACY Azure
+# tenant, while WYRE-AI org secrets (AZURE_CLIENT_ID/TENANT/SUBSCRIPTION) point
+# at the new WYRE AI tenant (60445ed9-…). Deploys from WYRE-AI repos will fail
+# with ResourceGroupNotFound until the fleet infra moves to the WYRE AI
+# subscription (or the legacy tenant app gets repo:WYRE-AI/* federated creds).
+# Called from each per-repo `.github/workflows/release.yml` `deploy` job after
+# semantic-release + docker push have produced a versioned image and its digest.
+#
+# What this workflow does:
+#   - Logs into Azure via OIDC
+#   - Deploys the image to `gwp-<vendor-slug>` in `mcp-gateway-prod` by IMMUTABLE
+#     digest (never :latest)
+#   - Sets an `IMAGE_VERSION` env var on the revision tying it back to release
+#     version + git SHA + workflow run ID
+#
+# Failure patterns this prevents:
+#   - Deploying to mcpgw-prod-<vendor> (orphaned legacy ACAs from a prior naming
+#     convention — the gateway routes vendor traffic to gwp-<vendor> per its
+#     VENDOR_URL_<VENDOR> env). Releases shipped to mcpgw-prod-* are silent no-ops.
+#   - Deploying by :latest tag, which can resolve to a stale digest through GHCR
+#     edge caches or ACA's image-pull layer — the deploy "succeeds" but the new
+#     revision actually rolls onto the prior image (observed in autotask-mcp on
+#     2026-05-13, broken for ~3 weeks).
+#
+# Inputs are passed through `env:` before any shell interpolation, so no
+# untrusted strings reach `run:` blocks (workflow_call inputs are typed and
+# come from sibling repo workflows we control, but defense-in-depth is cheap).
+
+on:
+  workflow_call:
+    inputs:
+      vendor-slug:
+        description: 'Vendor slug. Drives the target ACA name `gwp-<slug>` and is the source of truth for where the gateway routes traffic.'
+        required: true
+        type: string
+      image-name:
+        description: 'Full GHCR image base path (no tag/digest), e.g. `ghcr.io/wyre-technology/autotask-mcp`.'
+        required: true
+        type: string
+      digest:
+        description: 'Image digest (e.g. `sha256:abc123...`) produced by the callers `docker/build-push-action` step. Pass via the docker jobs `outputs.digest` (which itself wraps `steps.<push-id>.outputs.digest`).'
+        required: true
+        type: string
+      version:
+        description: 'Semver release version with no `v` prefix (e.g. `2.25.2`). Used only for legibility in the deployed revision''s IMAGE_VERSION env var.'
+        required: true
+        type: string
+      resource-group:
+        description: 'Azure resource group containing the target ACA.'
+        required: false
+        type: string
+        default: 'mcp-gateway-prod'
+      environment:
+        description: 'GitHub Environment to run in (for env-scoped secrets and deployment protection rules).'
+        required: false
+        type: string
+        default: 'production'
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.vendor-slug }} to gwp-${{ inputs.vendor-slug }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      TARGET_ACA: gwp-${{ inputs.vendor-slug }}
+      RESOURCE_GROUP: ${{ inputs.resource-group }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+      IMAGE_DIGEST: ${{ inputs.digest }}
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Azure Container Apps
+        run: |
+          set -euo pipefail
+
+          if [ -z "${IMAGE_DIGEST}" ]; then
+            echo "::error::Input 'digest' is empty. Pass the docker/build-push-action digest output (steps.<id>.outputs.digest) — refusing to deploy by mutable :latest tag." >&2
+            exit 1
+          fi
+          if [[ "${IMAGE_DIGEST}" != sha256:* ]]; then
+            echo "::error::Input 'digest' must start with 'sha256:' (got '${IMAGE_DIGEST}'). Refusing to deploy a non-digest reference." >&2
+            exit 1
+          fi
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          echo "Deploying ${IMAGE} to ${TARGET_ACA} (release v${RELEASE_VERSION}, sha ${SHORT_SHA}, run ${GITHUB_RUN_ID})"
+
+          az containerapp update \
+            --name "${TARGET_ACA}" \
+            --resource-group "${RESOURCE_GROUP}" \
+            --image "${IMAGE}" \
+            --set-env-vars "IMAGE_VERSION=v${RELEASE_VERSION}-sha-${SHORT_SHA}-${GITHUB_RUN_ID}"
+
+      # Route the container app's platform metrics (AllMetrics — includes
+      # CpuPercentage / MemoryPercentage) to the shared Log Analytics
+      # workspace. This is what feeds the fleet-wide vendor CPU/memory
+      # saturation alert (conduit observability.bicep ->
+      # alertVendorResourceSaturation, which queries the AzureMetrics table).
+      #
+      # Applied here, in the canonical deploy workflow, so it is templated
+      # ONCE across all ~40 gwp-* repos rather than hand-maintained per repo.
+      # diagnostic-settings create is idempotent — re-running with the same
+      # --name updates in place — so every release self-heals the setting.
+      #
+      # Permission: the deploy SP holds Contributor on the resource group,
+      # which covers Microsoft.Insights/diagnosticSettings/write. No extra
+      # grant is needed.
+      - name: Route container metrics to Log Analytics
+        env:
+          LOG_ANALYTICS_WORKSPACE: mcpgw-prod-logs
+        run: |
+          set -euo pipefail
+
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          ACA_ID=$(az containerapp show \
+            --name "${TARGET_ACA}" \
+            --resource-group "${RESOURCE_GROUP}" \
+            --query id -o tsv)
+          WORKSPACE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_WORKSPACE}"
+
+          echo "Ensuring AllMetrics diagnostic setting on ${TARGET_ACA} -> ${LOG_ANALYTICS_WORKSPACE}"
+          az monitor diagnostic-settings create \
+            --name gwp-metrics-to-law \
+            --resource "${ACA_ID}" \
+            --workspace "${WORKSPACE_ID}" \
+            --metrics '[{"category":"AllMetrics","enabled":true}]'
