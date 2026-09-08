@@ -388,6 +388,19 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      # Register binfmt handlers so buildx can build a foreign architecture on
+      # this amd64 runner. Required by any caller passing a non-amd64 entry in
+      # `platforms:` — buildx alone cannot emulate, so without this an arm64
+      # build fails with "exec format error" no matter what `platforms:` says.
+      # A no-op (a few seconds) for the default single-platform amd64 build,
+      # which every caller gets until it opts in.
+      #
+      # QEMU emulation is slow, so keep Dockerfiles free of `npm install -g`:
+      # npm's self-update under emulation is the difference between a ~2 minute
+      # and a 60+ minute arm64 build (hudu-mcp, 2026).
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a  # v4.3.0
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
 
