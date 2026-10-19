@@ -326,10 +326,67 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Recovery for a half-finished release. semantic-release pushes the
+      # vX.Y.Z tag first, then refs/notes/semantic-release-vX.Y.Z, then
+      # creates the GitHub Release. GitHub sometimes rejects the notes push with
+      # a bare `! [remote rejected] ... (failed)` (cipp-mcp run 38595079425,
+      # 2026-10-14; cisco-umbrella-mcp run 38989165701, 2026-10-17; neither
+      # repo has rulesets). semantic-release then exits 1 with the tag already
+      # on origin but no GitHub Release. Detect skips docker/registry/mcpb, so
+      # the fix commit never ships an image. A re-run can't recover it either,
+      # because semantic-release now sees the tag as already released.
+      #
+      # When semantic-release fails AND a semver tag it just pushed points at
+      # HEAD on origin, retry the notes push with backoff and create the
+      # missing GitHub Release, so Detect and the downstream jobs proceed.
+      # Every other failure (lint, auth, a tag push that never landed) still
+      # fails the job.
       - name: Semantic Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx semantic-release
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          npx semantic-release
+          rc=$?
+          set -e
+          [ "$rc" -eq 0 ] && exit 0
+
+          echo "::warning::semantic-release exited $rc; checking for a half-finished release"
+          git fetch --tags --force origin
+          HEAD_TAG=$(git tag --points-at HEAD --sort=-version:refname \
+            | grep -E '^v[0-9]' | head -1 || true)
+          if [ -z "$HEAD_TAG" ] \
+             || ! git ls-remote --exit-code --tags origin "refs/tags/$HEAD_TAG" >/dev/null; then
+            echo "::error::semantic-release failed and no release tag on HEAD reached origin; not recoverable here."
+            exit "$rc"
+          fi
+
+          NOTES_REF="refs/notes/semantic-release-$HEAD_TAG"
+          if ! git ls-remote --exit-code origin "$NOTES_REF" >/dev/null; then
+            if ! git show-ref --verify --quiet "$NOTES_REF"; then
+              # semantic-release writes this note locally before it pushes;
+              # recreate it if it's missing. {"channels":[null]} = default channel.
+              git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                notes --ref "semantic-release-$HEAD_TAG" add -f \
+                -m '{"channels":[null]}' "$HEAD_TAG"
+            fi
+            pushed=false
+            for delay in 5 15 30; do
+              sleep "$delay"
+              if git push origin "$NOTES_REF"; then pushed=true; break; fi
+            done
+            if [ "$pushed" != true ]; then
+              echo "::warning::Could not push $NOTES_REF after retries. Continuing: a missing note only drops channel metadata, and semantic-release treats the tag as the default channel."
+            fi
+          fi
+
+          if ! gh release view "$HEAD_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$HEAD_TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "$HEAD_TAG" --generate-notes
+          fi
+          echo "::notice::Recovered half-finished release $HEAD_TAG (semantic-release exit $rc)."
 
       - name: Detect released version
         id: detect
