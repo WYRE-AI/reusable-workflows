@@ -336,8 +336,9 @@ jobs:
       # the fix commit never ships an image. A re-run can't recover it either,
       # because semantic-release now sees the tag as already released.
       #
-      # When semantic-release fails AND a semver tag it just pushed points at
-      # HEAD on origin, retry the notes push with backoff and create the
+      # When semantic-release fails on the notes push (its output names the
+      # rejected refs/notes/semantic-release-<tag>) AND that tag is on origin
+      # at HEAD, retry the notes push with backoff and create the
       # missing GitHub Release, so Detect and the downstream jobs proceed.
       # Every other failure (lint, auth, a tag push that never landed) still
       # fails the job.
@@ -346,9 +347,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          release_log=$(mktemp)
           set +e
-          npx semantic-release
-          rc=$?
+          npx semantic-release 2>&1 | tee "$release_log"
+          rc=${PIPESTATUS[0]}
           set -e
           [ "$rc" -eq 0 ] && exit 0
 
@@ -363,6 +365,14 @@ jobs:
           fi
 
           NOTES_REF="refs/notes/semantic-release-$HEAD_TAG"
+          # Only recover the notes-push rejection. A failure in a later step
+          # (e.g. @semantic-release/github `success` commenting on issues/PRs
+          # after the Release exists) is a different problem and stays red.
+          if ! grep -Fq "$NOTES_REF" "$release_log" \
+             || ! grep -Fq "remote rejected" "$release_log"; then
+            echo "::error::semantic-release failed for a reason other than a rejected $NOTES_REF push; not recovering."
+            exit "$rc"
+          fi
           if ! git ls-remote --exit-code origin "$NOTES_REF" >/dev/null; then
             if ! git show-ref --verify --quiet "$NOTES_REF"; then
               # semantic-release writes this note locally before it pushes;
