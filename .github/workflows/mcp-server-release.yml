@@ -149,6 +149,15 @@ on:
         required: false
         type: string
         default: 'linux/amd64'
+      fail-on-severity:
+        description: >
+          Comma-separated Trivy severities that fail the Security Scan job,
+          e.g. "HIGH,CRITICAL". Empty (default) keeps the scan report-only.
+          The gate runs after the SARIF upload, so findings still reach code
+          scanning where it is available.
+        required: false
+        type: string
+        default: ''
     outputs:
       version:
         description: 'Released semver (no "v" prefix). Empty string when no release was cut.'
@@ -759,10 +768,12 @@ jobs:
     name: Publish to MCP Registry
     runs-on: ubuntu-latest
     needs: [release, docker]
+    # Private repos are never published to the public MCP Registry.
     if: >
       always() &&
       needs.release.outputs.released == 'true' &&
-      needs.docker.result == 'success'
+      needs.docker.result == 'success' &&
+      github.event.repository.private != true
     permissions:
       id-token: write   # GitHub OIDC auth to MCP Registry
       contents: read
@@ -870,7 +881,14 @@ jobs:
   #    no release or failed docker build → nothing to scan.
   #
   #    NOTE (private repos): SARIF upload requires GitHub Code Security to be
-  #    enabled on the repo; public repos get it for free.
+  #    enabled on the repo; public repos get it for free. The job probes the
+  #    code-scanning API first and skips only the upload (with a notice) when
+  #    code scanning is not available; the scan itself always runs, and
+  #    `fail-on-severity` still gates the job.
+  #
+  #    CALLER REQUIREMENT: the calling job must grant `actions: read` (the
+  #    SARIF upload reads workflow-run metadata on private repos). A caller
+  #    that repins to this version without it fails at workflow validation.
   # ────────────────────────────────────────────────────────────────────────────
   security:
     name: Security Scan
@@ -881,6 +899,7 @@ jobs:
       needs.release.outputs.released == 'true' &&
       needs.docker.result == 'success'
     permissions:
+      actions: read            # SARIF upload reads run metadata (private repos)
       contents: read
       packages: read           # ghcr pull of the just-pushed image
       security-events: write   # SARIF upload to code scanning
@@ -903,7 +922,36 @@ jobs:
           format: 'sarif'
           output: 'trivy-results.sarif'
 
+      # Code scanning is free on public repos and needs GitHub Code Security on
+      # private ones. Probe instead of assuming from visibility, so a private
+      # repo that has it enabled still uploads.
+      - name: Check code scanning availability
+        id: codescan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # 200, or 404 "no analysis found" (enabled, nothing uploaded yet) -> upload.
+          # 403 "not enabled" / "Advanced Security must be enabled" -> skip.
+          if gh api "repos/${REPO}/code-scanning/analyses?per_page=1" --silent 2>/tmp/codescan.err \
+            || grep -qi 'no analysis found' /tmp/codescan.err; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=SARIF upload skipped::Code scanning is not available on ${REPO} ($(head -c 200 /tmp/codescan.err)). The Trivy scan still ran."
+          fi
+
       - name: Upload Trivy scan results to GitHub code scanning
+        if: steps.codescan.outputs.available == 'true'
         uses: github/codeql-action/upload-sarif@c54b30b7df092240050e69945842bc67aee0f0f4  # v4.37.3
         with:
           sarif_file: 'trivy-results.sarif'
+
+      - name: Fail on ${{ inputs.fail-on-severity }} findings
+        if: inputs.fail-on-severity != ''
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8  # v0.36.0
+        with:
+          image-ref: '${{ inputs.image-name }}:v${{ needs.release.outputs.version }}'
+          format: 'table'
+          severity: ${{ inputs.fail-on-severity }}
+          exit-code: '1'
