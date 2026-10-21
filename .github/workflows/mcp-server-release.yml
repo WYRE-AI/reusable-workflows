@@ -149,6 +149,16 @@ on:
         required: false
         type: string
         default: 'linux/amd64'
+      publish-to-registry:
+        description: >
+          Publish to the public MCP Registry (registry.modelcontextprotocol.io).
+          The registry only accepts publicly pullable OCI images, so set this to
+          false for a server whose GHCR package is meant to stay private (for
+          example a private repo). Docker push, MCPB and the security scan still
+          run either way.
+        required: false
+        type: boolean
+        default: true
     outputs:
       version:
         description: 'Released semver (no "v" prefix). Empty string when no release was cut.'
@@ -761,6 +771,7 @@ jobs:
     needs: [release, docker]
     if: >
       always() &&
+      inputs.publish-to-registry &&
       needs.release.outputs.released == 'true' &&
       needs.docker.result == 'success'
     permissions:
@@ -806,6 +817,58 @@ jobs:
       #   unneeded complexity. If this workflow ever moves to an ARM runner,
       #   MCP_PUBLISHER_ASSET below must change too — it will NOT
       #   auto-detect the way the old curl command did.
+      # PRIVATE-IMAGE PREFLIGHT (2026-10-21). The registry validates that the
+      # OCI identifier is anonymously pullable and rejects the publish with a
+      # 400 ("OCI image ... is private or requires authentication. Only public
+      # images are supported") when it is not. GHCR creates every new container
+      # package as PRIVATE, so a server's first release always failed here
+      # until someone flipped the package to public by hand (watchguard-cloud-mcp,
+      # timedoctor-mcp, petra-mcp, unifi-mcp, Oct 2026). The check below does
+      # the same anonymous pull the registry does and fails with the exact fix,
+      # before cosign and mcp-publisher run. It adds nothing new to trust: the
+      # anonymous token endpoint and the manifest HEAD are both public reads.
+      - name: 'Preflight: image must be publicly pullable'
+        env:
+          REF: v${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          REPO_PATH="${IMAGE_NAME#ghcr.io/}"
+          PKG="${REPO_PATH#*/}"
+          OWNER="${REPO_PATH%%/*}"
+          SETTINGS_URL="https://github.com/orgs/${OWNER}/packages/container/package/${PKG}/settings"
+          private_error() {
+            echo "::error title=GHCR package is private::${IMAGE_NAME}:${REF} is not anonymously pullable ($1), so the MCP Registry will reject the publish. A package admin must set it to Public: ${SETTINGS_URL} -> Danger Zone -> Change visibility (no API exists for this). Then re-run this job. If this server must stay private, pass publish-to-registry: false from the caller instead."
+            exit 1
+          }
+          transient_error() {
+            echo "::error title=GHCR unavailable::Could not check whether ${IMAGE_NAME}:${REF} is public ($1). This is a GHCR/network error, not a visibility problem. Re-run this job; if it persists check https://www.githubstatus.com."
+            exit 1
+          }
+          # Anonymous token. Capture the status instead of masking failures:
+          # 401/403 means auth/visibility; anything else (000, 429, 5xx) is a
+          # token-service error and must not be reported as "private".
+          TOKEN_BODY=$(mktemp)
+          TOKEN_STATUS=$(curl -sS --retry 3 --retry-delay 2 -o "$TOKEN_BODY" -w '%{http_code}' \
+            "https://ghcr.io/token?scope=repository:${REPO_PATH}:pull") || TOKEN_STATUS=000
+          case "$TOKEN_STATUS" in
+            200) ;;
+            401|403) private_error "token endpoint HTTP ${TOKEN_STATUS}" ;;
+            *) transient_error "token endpoint HTTP ${TOKEN_STATUS}" ;;
+          esac
+          TOKEN=$(jq -r '.token // empty' "$TOKEN_BODY" 2>/dev/null) || TOKEN=""
+          [ -n "$TOKEN" ] || transient_error "token endpoint returned HTTP 200 without a token"
+          STATUS=$(curl -sS --retry 3 --retry-delay 2 -o /dev/null -w '%{http_code}' -I \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/${REPO_PATH}/manifests/${REF}") || STATUS=000
+          case "$STATUS" in
+            200) ;;
+            401|403) private_error "manifest HTTP ${STATUS}" ;;
+            404) echo "::error title=GHCR image tag not found::${IMAGE_NAME}:${REF} returned HTTP 404 to an anonymous pull. Either the tag was not pushed, or the package is private (GHCR can hide private packages as 404). Check the image build job, then the package visibility at ${SETTINGS_URL}."; exit 1 ;;
+            *) transient_error "manifest HTTP ${STATUS}" ;;
+          esac
+          echo "${IMAGE_NAME}:${REF} is publicly pullable."
+
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
 
