@@ -932,14 +932,26 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           # 200, or 404 "no analysis found" (enabled, nothing uploaded yet) -> upload.
-          # 403 "not enabled" / "Advanced Security must be enabled" -> skip.
-          if gh api "repos/${REPO}/code-scanning/analyses?per_page=1" --silent 2>/tmp/codescan.err \
-            || grep -qi 'no analysis found' /tmp/codescan.err; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=SARIF upload skipped::Code scanning is not available on ${REPO} ($(head -c 200 /tmp/codescan.err)). The Trivy scan still ran."
-          fi
+          # 403 "Code Security / Advanced Security must be enabled" -> skip upload.
+          # Anything else (5xx, rate limit, network) is NOT treated as disabled:
+          # retry, then fail the job so a report-only scan can't go green
+          # without recording its SARIF.
+          for attempt in 1 2 3; do
+            if gh api "repos/${REPO}/code-scanning/analyses?per_page=1" --silent 2>/tmp/codescan.err \
+              || grep -qi 'no analysis found' /tmp/codescan.err; then
+              echo "available=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if grep -qiE 'must be enabled|not enabled' /tmp/codescan.err; then
+              echo "available=false" >> "$GITHUB_OUTPUT"
+              echo "::notice title=SARIF upload skipped::Code scanning is not available on ${REPO} ($(head -c 200 /tmp/codescan.err)). The Trivy scan still ran."
+              exit 0
+            fi
+            echo "::warning::Code scanning probe attempt ${attempt} failed: $(head -c 200 /tmp/codescan.err)"
+            sleep $((attempt * 10))
+          done
+          echo "::error title=Code scanning probe failed::Could not determine code scanning availability on ${REPO}: $(head -c 200 /tmp/codescan.err)"
+          exit 1
 
       - name: Upload Trivy scan results to GitHub code scanning
         if: steps.codescan.outputs.available == 'true'
