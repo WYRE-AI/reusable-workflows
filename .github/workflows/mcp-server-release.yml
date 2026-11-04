@@ -852,8 +852,27 @@ jobs:
       - name: Authenticate to MCP Registry (GitHub OIDC)
         run: ./mcp-publisher login github-oidc
 
+      # Idempotent publish. A second push of an already-released HEAD (e.g.
+      # the same SHA pushed to main twice, or a re-run after a successful
+      # publish) re-detects the tag as releasable and reaches this step with
+      # a version the registry already holds. Registry versions are
+      # immutable, so "cannot publish duplicate version" means this exact
+      # version is already listed: treat it as success. Every other error
+      # still fails the job. (cork-mcp run 39800680209, Oct 22: v1.0.1
+      # published by the first run, the second run on the same SHA 400'd.)
       - name: Publish to MCP Registry
-        run: ./mcp-publisher publish
+        run: |
+          set +e
+          ./mcp-publisher publish 2>&1 | tee publish.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            if grep -q 'cannot publish duplicate version' publish.log; then
+              echo "::notice title=Already published::${VERSION} is already in the MCP Registry; nothing to publish."
+              exit 0
+            fi
+            exit "$rc"
+          fi
 
       - name: Verify registry listing
         run: |

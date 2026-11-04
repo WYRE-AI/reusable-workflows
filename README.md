@@ -11,7 +11,9 @@ health files, the activity notifier, docs) stays in `WYRE-AI/.github`.
 ## Workflows
 
 - `.github/workflows/mcp-server-release.yml` — semantic-release → Docker/GHCR →
-  MCPB bundle → MCP Registry publish → Trivy scan.
+  MCPB bundle → MCP Registry publish → Trivy scan. The registry publish is
+  idempotent: if the version is already listed ("cannot publish duplicate
+  version"), the step logs a notice and succeeds instead of failing the run.
 - `.github/workflows/mcp-server-deploy.yml` — Azure Container Apps deploy via
   OIDC, by immutable image digest.
 
