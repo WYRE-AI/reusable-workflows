@@ -80,10 +80,18 @@ Notes for the caller change:
 - The PR check name changes from `release / Build, Lint, Test` to
   `verify / Build, Lint, Test`. Update any branch protection or ruleset that
   requires the old name, or PRs will wait for a check that never reports.
+  **Order matters:** the repin PR itself reports only the new name, so it cannot
+  merge while branch protection still requires the old one. Drop the old
+  required check from branch protection before merging the caller change, then
+  add `verify / Build, Lint, Test`. As of 2026-11-11 four repos require the old
+  name: `syncro-mcp`, `ninjaone-mcp`, `nutanix-mcp` and `axcient-mcp`.
 - Any `deploy` job that has `needs: release` keeps working: it only matters on
   push, where `release` still runs.
-- `secrets: inherit` can be dropped from the push job too. Nothing here reads a
-  secret other than `GITHUB_TOKEN`, which is always available.
+- `secrets: inherit` can be dropped from the push job too, for the release
+  workflow only. It reads nothing but `GITHUB_TOKEN`, which is always
+  available. `mcp-server-deploy.yml` is different: it declares its own
+  `secrets:` and needs `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and
+  `AZURE_SUBSCRIPTION_ID`, so a `deploy` job keeps them.
 - A caller-level `permissions:` block cannot be made conditional on the event:
   `permissions` does not accept expressions. Separate jobs are the way.
 
