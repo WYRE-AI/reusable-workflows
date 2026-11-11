@@ -107,10 +107,34 @@ name: MCP Server Release (reusable)
 #   itself for the full detail and why this is a new parallel job rather than
 #   a restructure of `release`'s own (unchanged) steps.
 #
+# SIXTH FIX: pull_request runs must be verify-only with least privilege
+# (WYREAI-714).
+#
+#   Callers trigger on push AND pull_request with a job-level grant of
+#   contents/packages/id-token/issues/pull-requests/security-events: write and
+#   `secrets: inherit`. A reusable workflow can only NARROW that grant, so this
+#   file does what it can: `verify` declares `contents: read` + `packages: read`
+#   itself (no write token, no id-token), references no secret except the
+#   automatic GITHUB_TOKEN, checks out with `persist-credentials: false`, and
+#   installs with `--ignore-scripts` so no dependency lifecycle script runs
+#   while the npm auth token is in the environment. Every job that publishes,
+#   pushes, uploads or holds OIDC is additionally gated on
+#   `github.event_name == 'push'`, not just on `released == 'true'`.
+#
+#   What this file CANNOT do is remove the caller's own grant: the caller job's
+#   `permissions` still define the ceiling, and a nested job that requests more
+#   than that ceiling fails workflow validation even if its `if:` would skip it.
+#   So a caller job with read-only permissions cannot call THIS file at all.
+#   Callers that want the grant gone on pull_request call the verify-only
+#   `mcp-server-verify.yml` from a pull_request-only job and this file from a
+#   push-only job. See README "Least privilege on pull_request".
+#   `mcp-server-verify.yml` repeats `verify` below; keep the two in sync.
+#
 # GATING CONTRACT:
-#   verify       ← unconditional. Runs on push AND pull_request alike.
+#   verify       ← unconditional. Runs on push AND pull_request alike, with
+#                  contents: read + packages: read only.
 #   release      ← push-to-main only, AND needs: [verify].
-#   docker       ← runs only when release.outputs.released == 'true'
+#   docker       ← push AND release.outputs.released == 'true'
 #   mcpb         ← same gate, in its own job needing only `release`, so a pack
 #                  failure does not stop docker/mcp-registry/security from
 #                  running here. NOTE: that is workflow-internal only. Callers
@@ -119,7 +143,7 @@ name: MCP Server Release (reusable)
 #                  needs: release`. A pack failure IS deploy-blocking from the
 #                  caller's side — see the note above the mcpb job.
 #   mcp-registry ← always() ensures its `if:` is evaluated even when docker
-#                  was skipped; then guards on released == 'true' AND
+#                  was skipped; then guards on push AND released == 'true' AND
 #                  docker result == 'success'.
 #   security     ← same gating as mcp-registry: scans the exact image tag the
 #                  docker job just pushed and uploads SARIF to code scanning.
@@ -233,6 +257,33 @@ jobs:
   #    repo without a working build script was never going to survive the
   #    existing `release` job's own unconditional `npm run build` either, so
   #    requiring it here changes nothing about what already had to hold true.
+  #
+  #    LEAST PRIVILEGE (WYREAI-714). This job runs PR code (build, lint, test)
+  #    on every pull_request, so it is the one job here that must hold nothing
+  #    worth stealing:
+  #      - `permissions` below REPLACES the caller's grant for this job, so even
+  #        if the caller granted contents/packages/id-token/security-events:
+  #        write, this job gets contents: read + packages: read and nothing
+  #        else (every unlisted scope, id-token included, is `none`).
+  #        `packages: read` is kept because npm.pkg.github.com needs it to serve
+  #        the @wyre-* SDKs (see the 403 note on the release job's install);
+  #        it is read-only.
+  #      - no secret is referenced except the automatic GITHUB_TOKEN, so
+  #        `secrets: inherit` in a caller exposes nothing to any step here.
+  #      - checkout drops the token from .git/config (`persist-credentials:
+  #        false`); the build/lint/test steps never needed it.
+  #      - `npm ci --ignore-scripts`: dependency lifecycle scripts would
+  #        otherwise run with NODE_AUTH_TOKEN (the GITHUB_TOKEN) in their
+  #        environment. Safe here because this job runs `npm run build`
+  #        explicitly, so the repos' `prepare: npm run build` (15 fleet repos)
+  #        is not needed, and native tools that ship their binary as an
+  #        optional dependency (esbuild/tsup, msw, workerd, unrs-resolver) do
+  #        not need their postinstall to run. Checked 2026-11-11: build, lint
+  #        and test pass with --ignore-scripts on autotask-mcp (the only repo
+  #        with sqlite3), iqms-mcp (oracledb), rootly-mcp / ironscales-mcp /
+  #        mimecast-mcp (workerd), marketsharp-mcp, hudu-mcp and cipp-mcp.
+  #        The `release`, `mcpb` and docker paths keep running scripts: they
+  #        are push-only and their output ships.
   # ────────────────────────────────────────────────────────────────────────────
   verify:
     name: Build, Lint, Test
@@ -244,6 +295,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
@@ -262,7 +315,7 @@ jobs:
         run: echo "@wyre-technology:registry=https://npm.pkg.github.com" >> "$NPM_CONFIG_USERCONFIG"
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -450,7 +503,10 @@ jobs:
     # produced an empty version output, docker still ran and hit the
     # "RELEASE_VERSION is empty" guard, silently cascading mcp-registry to
     # `skipped`. Now docker simply does not run unless a real release was cut.
-    if: needs.release.outputs.released == 'true'
+    # The event check is redundant with `released` (release only runs on push)
+    # and kept so a pull_request run can never reach a job holding
+    # `packages: write`, whatever the output says.
+    if: github.event_name == 'push' && needs.release.outputs.released == 'true'
     permissions:
       contents: read
       packages: write
@@ -650,7 +706,7 @@ jobs:
     name: Pack and upload MCPB bundle
     runs-on: ubuntu-latest
     needs: [release]
-    if: needs.release.outputs.released == 'true'
+    if: github.event_name == 'push' && needs.release.outputs.released == 'true'
     permissions:
       contents: write   # gh release upload
       packages: read    # npm ci of @wyre-technology/* SDKs from GitHub Packages
@@ -773,7 +829,8 @@ jobs:
       always() &&
       needs.release.outputs.released == 'true' &&
       needs.docker.result == 'success' &&
-      github.event.repository.private != true
+      github.event.repository.private != true &&
+      github.event_name == 'push'
     permissions:
       id-token: write   # GitHub OIDC auth to MCP Registry
       contents: read
@@ -897,9 +954,10 @@ jobs:
     if: >
       always() &&
       needs.release.outputs.released == 'true' &&
-      needs.docker.result == 'success'
+      needs.docker.result == 'success' &&
+      github.event_name == 'push'
     permissions:
-      actions: read            # SARIF upload reads run metadata (private repos)
+      actions: read           # SARIF upload reads run metadata (private repos)
       contents: read
       packages: read           # ghcr pull of the just-pushed image
       security-events: write   # SARIF upload to code scanning
