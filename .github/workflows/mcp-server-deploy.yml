@@ -115,16 +115,17 @@ jobs:
       # Check the actual OIDC token GitHub will hand to Azure: its subject must be
       # environment-scoped for this repo (repo:<owner>/<repo>:environment:production,
       # or the immutable repo:<owner>@<id>/<repo>@<id>:environment:production form),
-      # and it must come from this reusable workflow. A ref- or pull_request-scoped
+      # Both are exact matches. It must also come from this reusable workflow at
+      # refs/heads/main or a full 40-hex commit SHA. A ref- or pull_request-scoped
       # subject means the caller did not run the job in the protected environment.
       # The token is masked and never printed; only decoded claims are compared.
       - name: Verify OIDC subject is environment-scoped
         env:
           EXPECTED_SUB: repo:${{ github.repository }}:environment:${{ inputs.environment }}
-          # Repos with GitHub's immutable OIDC subject format (the WYRE-AI default)
-          # present repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:<env>.
-          EXPECTED_SUB_IMMUTABLE: repo:${{ github.repository_owner }}@${{ github.repository_owner_id }}/${{ github.event.repository.name }}@${{ github.repository_id }}:environment:${{ inputs.environment }}
-          EXPECTED_WORKFLOW_PREFIX: WYRE-AI/reusable-workflows/.github/workflows/mcp-server-deploy.yml@
+          REPO_OWNER_ID: ${{ github.repository_owner_id }}
+          REPO_ID: ${{ github.repository_id }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+          EXPECTED_WORKFLOW_PATH: WYRE-AI/reusable-workflows/.github/workflows/mcp-server-deploy.yml
         run: |
           set -euo pipefail
           if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
@@ -141,17 +142,28 @@ jobs:
           unset OIDC_TOKEN PAYLOAD
           SUB=$(jq -r '.sub // ""' <<<"${CLAIMS}")
           JOB_WORKFLOW_REF=$(jq -r '.job_workflow_ref // ""' <<<"${CLAIMS}")
-          if [ "${SUB}" != "${EXPECTED_SUB}" ] && [ "${SUB}" != "${EXPECTED_SUB_IMMUTABLE}" ]; then
-            echo "::error::OIDC subject is '${SUB}', expected '${EXPECTED_SUB}' or '${EXPECTED_SUB_IMMUTABLE}'. Refusing to request an Azure token." >&2
+          # Immutable form (the WYRE-AI default), built from the run's own
+          # owner/repo ids. The token's repository_owner_id / repository_id
+          # claims must agree with them.
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          EXPECTED_SUB_IMMUTABLE="repo:${OWNER}@${REPO_OWNER_ID}/${REPO}@${REPO_ID}:environment:${DEPLOY_ENVIRONMENT}"
+          CLAIM_OWNER_ID=$(jq -r '.repository_owner_id // ""' <<<"${CLAIMS}")
+          CLAIM_REPO_ID=$(jq -r '.repository_id // ""' <<<"${CLAIMS}")
+          if [ -z "${REPO_OWNER_ID}" ] || [ -z "${REPO_ID}" ] \
+             || [ "${CLAIM_OWNER_ID}" != "${REPO_OWNER_ID}" ] || [ "${CLAIM_REPO_ID}" != "${REPO_ID}" ]; then
+            echo "::error::OIDC repository ids (owner '${CLAIM_OWNER_ID}', repo '${CLAIM_REPO_ID}') do not match this run (owner '${REPO_OWNER_ID}', repo '${REPO_ID}'). Refusing to request an Azure token." >&2
             exit 1
           fi
-          case "${JOB_WORKFLOW_REF}" in
-            "${EXPECTED_WORKFLOW_PREFIX}"*) ;;
-            *)
-              echo "::error::OIDC job_workflow_ref is '${JOB_WORKFLOW_REF}', expected '${EXPECTED_WORKFLOW_PREFIX}<sha>'. Refusing to deploy." >&2
-              exit 1
-              ;;
-          esac
+          if [ "${SUB}" != "${EXPECTED_SUB}" ] && [ "${SUB}" != "${EXPECTED_SUB_IMMUTABLE}" ]; then
+            echo "::error::OIDC subject is '${SUB}', expected exactly '${EXPECTED_SUB}' or '${EXPECTED_SUB_IMMUTABLE}'. Refusing to request an Azure token." >&2
+            exit 1
+          fi
+          WF_REF_RE="^${EXPECTED_WORKFLOW_PATH//./\\.}@(refs/heads/main|[0-9a-f]{40})$"
+          if ! [[ "${JOB_WORKFLOW_REF}" =~ ${WF_REF_RE} ]]; then
+            echo "::error::OIDC job_workflow_ref is '${JOB_WORKFLOW_REF}', expected '${EXPECTED_WORKFLOW_PATH}@refs/heads/main' or '${EXPECTED_WORKFLOW_PATH}@<40-hex sha>'. Refusing to deploy." >&2
+            exit 1
+          fi
           echo "OIDC subject OK: ${SUB} (${JOB_WORKFLOW_REF})"
 
       - name: Azure login (OIDC)
