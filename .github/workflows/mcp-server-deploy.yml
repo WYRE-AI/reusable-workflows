@@ -55,7 +55,7 @@ on:
         type: string
         default: 'mcp-gateway-prod'
       environment:
-        description: 'GitHub Environment to run in (for env-scoped secrets and deployment protection rules).'
+        description: 'GitHub Environment to run in (for env-scoped secrets and deployment protection rules). Must be `production`; the job refuses anything else before requesting an Azure token. The caller repo''s `production` environment must have a main-only deployment branch policy.'
         required: false
         type: string
         default: 'production'
@@ -82,6 +82,78 @@ jobs:
       IMAGE_DIGEST: ${{ inputs.digest }}
       RELEASE_VERSION: ${{ inputs.version }}
     steps:
+      # Ported from WYRE-AI/.github#4 @ 830dd461 so this copy has the same guard.
+      # SECURRRRRRRITY condition 2 on WYRE-AI/.github#4: the org Azure federated
+      # credential is still a repo:WYRE-AI* wildcard, so this workflow must not
+      # rely on it. These two guards run BEFORE azure/login and fail the job
+      # (instead of skipping) when the run is not a main-branch production
+      # deploy. They are defense in depth only; the real controls are a narrowed
+      # FIC subject and a main-only branch policy on each caller's environment.
+      - name: Refuse non-main or non-production deploys
+        env:
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+          EVENT_NAME: ${{ github.event_name }}
+          CALLER_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "${CALLER_REF}" != "refs/heads/main" ]; then
+            echo "::error::mcp-server-deploy only runs from refs/heads/main (got '${CALLER_REF}'). Refusing to request an Azure token." >&2
+            exit 1
+          fi
+          case "${EVENT_NAME}" in
+            push|workflow_dispatch) ;;
+            *)
+              echo "::error::mcp-server-deploy only runs on push or workflow_dispatch (got '${EVENT_NAME}'). Refusing to request an Azure token." >&2
+              exit 1
+              ;;
+          esac
+          if [ "${DEPLOY_ENVIRONMENT}" != "production" ]; then
+            echo "::error::mcp-server-deploy only deploys through the 'production' GitHub Environment (got '${DEPLOY_ENVIRONMENT}'). Its federated credential subject must be environment-scoped." >&2
+            exit 1
+          fi
+
+      # Check the actual OIDC token GitHub will hand to Azure: its subject must be
+      # environment-scoped for this repo (repo:<owner>/<repo>:environment:production,
+      # or the immutable repo:<owner>@<id>/<repo>@<id>:environment:production form),
+      # and it must come from this reusable workflow. A ref- or pull_request-scoped
+      # subject means the caller did not run the job in the protected environment.
+      # The token is masked and never printed; only decoded claims are compared.
+      - name: Verify OIDC subject is environment-scoped
+        env:
+          EXPECTED_SUB: repo:${{ github.repository }}:environment:${{ inputs.environment }}
+          # Repos with GitHub's immutable OIDC subject format (the WYRE-AI default)
+          # present repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:<env>.
+          EXPECTED_SUB_IMMUTABLE: repo:${{ github.repository_owner }}@${{ github.repository_owner_id }}/${{ github.event.repository.name }}@${{ github.repository_id }}:environment:${{ inputs.environment }}
+          EXPECTED_WORKFLOW_PREFIX: WYRE-AI/reusable-workflows/.github/workflows/mcp-server-deploy.yml@
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::No OIDC token available (id-token: write missing?). Refusing to deploy." >&2
+            exit 1
+          fi
+          OIDC_TOKEN=$(curl -sSf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r '.value')
+          echo "::add-mask::${OIDC_TOKEN}"
+          PAYLOAD=$(printf '%s' "${OIDC_TOKEN}" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#PAYLOAD} % 4 )) -ne 0 ]; do PAYLOAD="${PAYLOAD}="; done
+          CLAIMS=$(printf '%s' "${PAYLOAD}" | base64 -d)
+          unset OIDC_TOKEN PAYLOAD
+          SUB=$(jq -r '.sub // ""' <<<"${CLAIMS}")
+          JOB_WORKFLOW_REF=$(jq -r '.job_workflow_ref // ""' <<<"${CLAIMS}")
+          if [ "${SUB}" != "${EXPECTED_SUB}" ] && [ "${SUB}" != "${EXPECTED_SUB_IMMUTABLE}" ]; then
+            echo "::error::OIDC subject is '${SUB}', expected '${EXPECTED_SUB}' or '${EXPECTED_SUB_IMMUTABLE}'. Refusing to request an Azure token." >&2
+            exit 1
+          fi
+          case "${JOB_WORKFLOW_REF}" in
+            "${EXPECTED_WORKFLOW_PREFIX}"*) ;;
+            *)
+              echo "::error::OIDC job_workflow_ref is '${JOB_WORKFLOW_REF}', expected '${EXPECTED_WORKFLOW_PREFIX}<sha>'. Refusing to deploy." >&2
+              exit 1
+              ;;
+          esac
+          echo "OIDC subject OK: ${SUB} (${JOB_WORKFLOW_REF})"
+
       - name: Azure login (OIDC)
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
         with:
